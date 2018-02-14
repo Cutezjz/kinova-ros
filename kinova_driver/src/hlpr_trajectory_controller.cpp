@@ -193,27 +193,39 @@ void JacoTrajectoryController::executeSmoothTrajectory(const control_msgs::Follo
     prevPoint[i] = trajectoryPoints[i][0];
   }
 
-  //determine time component of trajectories for each joint
-  for (unsigned int i = 1; i < numPoints; i++)
+  //check if time provided
+  bool givenTime = (goal->trajectory.points[numPoints-1].time_from_start.toSec() > 0);
+
+  if (givenTime)
   {
-    float maxTime = 0.0;
-    for (unsigned int j = 0; j < NUM_JACO_JOINTS; j++)
+    //use given time from start as time points
+    for (unsigned int i = 1; i < numPoints; i++)
+      timePoints[i] = goal->trajectory.points[i].time_from_start.toSec();
+  }
+  else
+  {
+    //determine time component of trajectories for each joint
+    for (unsigned int i = 1; i < numPoints; i++)
     {
-      //calculate approximate time required to move to the next position
-      float time = fabs(trajectoryPoints[j][i] - prevPoint[j]);
-      if (j <= 3)
-        time /= (LARGE_ACTUATOR_VELOCITY*0.9);  // run slightly below max speed
-      else
-        time /= (SMALL_ACTUATOR_VELOCITY*0.9);  // run slightly below max speed
+      float maxTime = 0.0;
+      for (unsigned int j = 0; j < NUM_JACO_JOINTS; j++)
+      {
+        //calculate approximate time required to move to the next position
+        float time = fabs(trajectoryPoints[j][i] - prevPoint[j]);
+        if (j <= 3)
+          time /= (LARGE_ACTUATOR_VELOCITY*0.9);  // run slightly below max speed
+        else
+          time /= (SMALL_ACTUATOR_VELOCITY*0.9);  // run slightly below max speed
 
-      if (time > maxTime)
-        maxTime = time;
+        if (time > maxTime)
+          maxTime = time;
 
-      jointPoints[j][i] = trajectoryPoints[j][i];
-      prevPoint[j] = trajectoryPoints[j][i];
+        jointPoints[j][i] = trajectoryPoints[j][i];
+        prevPoint[j] = trajectoryPoints[j][i];
+      }
+
+      timePoints[i] = timePoints[i - 1] + maxTime;
     }
-
-    timePoints[i] = timePoints[i - 1] + maxTime;
   }
 
   // Spline the given points to smooth the trajectory
