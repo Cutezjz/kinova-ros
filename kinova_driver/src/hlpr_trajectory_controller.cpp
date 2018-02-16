@@ -193,6 +193,9 @@ void JacoTrajectoryController::executeSmoothTrajectory(const control_msgs::Follo
     prevPoint[i] = trajectoryPoints[i][0];
   }
 
+  double slowdown_factor;
+  pnh.param("slowdown_factor", slowdown_factor, 1.0);
+
   //determine time component of trajectories for each joint
   for (unsigned int i = 1; i < numPoints; i++)
   {
@@ -213,7 +216,7 @@ void JacoTrajectoryController::executeSmoothTrajectory(const control_msgs::Follo
       prevPoint[j] = trajectoryPoints[j][i];
     }
 
-    timePoints[i] = timePoints[i - 1] + maxTime;
+    timePoints[i] = timePoints[i - 1] + maxTime*slowdown_factor;
   }
 
   // Spline the given points to smooth the trajectory
