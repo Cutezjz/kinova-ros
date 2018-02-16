@@ -45,6 +45,9 @@ public:
 
   void executeSmoothTrajectory(const control_msgs::FollowJointTrajectoryGoalConstPtr &goal);
 
+  void execute_timed_trajectory(const control_msgs::FollowJointTrajectoryGoalConstPtr &goal);
+
+
 private:
   ros::NodeHandle n;
   ros::NodeHandle pnh;

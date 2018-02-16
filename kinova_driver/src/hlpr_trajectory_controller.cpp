@@ -4,9 +4,15 @@ using namespace std;
 
 JacoTrajectoryController::JacoTrajectoryController() : pnh("~"),
   smoothTrajectoryServer(pnh, "trajectory", boost::bind(&JacoTrajectoryController::executeSmoothTrajectory, this, _1), false)
+
+
 {
   pnh.param("max_curvature", maxCurvature, 100.0);
   pnh.param("sim", sim_flag_, false);
+
+  // Add in the timed trajectory server from wpi_jaco_wrapper
+  timed_trajectory_server_ = new TrajectoryServer(pnh, "timed_trajectory", boost::bind(&JacoArmTrajectoryController::execute_timed_trajectory, this, _1), false);
+
 
   jointNames.clear();
   jointNames.push_back("j2s7s300_joint_1");
@@ -49,6 +55,7 @@ JacoTrajectoryController::JacoTrajectoryController() : pnh("~"),
 
   // Start the trajectory server
   smoothTrajectoryServer.start();
+  timed_trajectory_server_.start();
 }
 
 /** Fake Gravity Comp Services for Simulation **/
@@ -160,6 +167,166 @@ static inline double nearest_equivalent(double desired, double current)
     return medVal;
   return highVal;
 }
+
+
+/****************************************************/
+/***********  Timed Arm Velocity Control *************/
+/****************************************************/
+/**
+ *  Arm controller. Trajectory has NUM_JACO_JOINTS (0 to NUM_JACO_JOINTS-1) for arm.
+ **/
+void JacoArmTrajectoryController::execute_timed_trajectory(const control_msgs::FollowJointTrajectoryGoalConstPtr &goal)
+{
+  //check for cancel
+  if (eStopEnabled)
+  {
+    control_msgs::FollowJointTrajectoryResult result;
+    result.error_code = control_msgs::FollowJointTrajectoryResult::PATH_TOLERANCE_VIOLATED;
+    timed_trajectory_server_->setSucceeded(result);
+    return;
+  }
+  int num_points = goal->trajectory.points.size();
+  if (num_points < 2)
+  {
+    control_msgs::FollowJointTrajectoryResult result;
+    result.error_code = control_msgs::FollowJointTrajectoryResult::INVALID_GOAL;
+    timed_trajectory_server_->setSucceeded(result);
+    return;
+  }
+
+  ROS_INFO("Starting trajectory on real robot.");
+
+  double sec = (goal->trajectory.points[1].time_from_start - goal->trajectory.points[0].time_from_start).toSec();
+  std::cout << sec << std::endl;
+  double inner_sec = 1.0 / 600;
+  TrajectoryPoint traj_point;
+  traj_point.InitStruct();
+  traj_point.Position.Type = ANGULAR_VELOCITY;
+  traj_point.Position.HandMode = HAND_NOMOVEMENT;
+
+  ecl::Array<double> time_points(num_points);
+  vector<ecl::Array<double> > joint_points(NUM_JACO_JOINTS);
+  vector<ecl::SmoothLinearSpline> splines(NUM_JACO_JOINTS);
+  AngularPosition position_data;
+  double current_joint_pos[NUM_JACO_JOINTS];
+  float current_point;
+  float error[NUM_JACO_JOINTS];
+  float prev_error[NUM_JACO_JOINTS] = {0};
+  double t;
+
+  for (int j = 0; j < NUM_JACO_JOINTS; j++)
+  {
+    joint_points[j].resize(num_points);
+    for (int i = 0; i < num_points; i++)
+      joint_points[j][i] = goal->trajectory.points[i].positions[j];
+  }
+  for (int i = 0; i < num_points; i++)
+    time_points[i] = (goal->trajectory.points[i].time_from_start).toSec();
+
+  try
+  {
+    for (int j = 0; j < NUM_JACO_JOINTS; j++)
+      splines.at(j) = ecl::SmoothLinearSpline(time_points, joint_points[j], max_curvature_);
+  }
+  catch (std::exception &exc)
+  {
+    std::cerr << exc.what();
+    ROS_ERROR("Trajectory could not be generated. Aborting trajectory action.");
+    control_msgs::FollowJointTrajectoryResult result;
+    result.error_code = control_msgs::FollowJointTrajectoryResult::PATH_TOLERANCE_VIOLATED;
+    timed_trajectory_server_->setAborted(result);
+    return;
+  }
+
+  ros::Rate rate(1 / sec);
+  ros::Rate inner_rate(1 / inner_sec);
+  int inner_loop = floor((1 / inner_sec) / (1 / sec));
+  if (inner_loop < 1)
+  {
+    ROS_INFO("Control loop for kinova arm cannot be more than 600Hz.");
+    control_msgs::FollowJointTrajectoryResult result;
+    result.error_code = control_msgs::FollowJointTrajectoryResult::INVALID_GOAL;
+    timed_trajectory_server_->setAborted(result);
+  }
+
+  for (int i = 0; i < num_points; i++)
+  {
+    // check eStop
+    if (eStopEnabled)
+    {
+      control_msgs::FollowJointTrajectoryResult result;
+      result.error_code = control_msgs::FollowJointTrajectoryResult::PATH_TOLERANCE_VIOLATED;
+      timed_trajectory_server_->setSucceeded(result);
+      return;
+    }
+    // check preempt request
+    if (timed_trajectory_server_->isPreemptRequested())
+    {
+      traj_point.Position.Actuators.Actuator1 = 0.0;
+      traj_point.Position.Actuators.Actuator2 = 0.0;
+      traj_point.Position.Actuators.Actuator3 = 0.0;
+      traj_point.Position.Actuators.Actuator4 = 0.0;
+      traj_point.Position.Actuators.Actuator5 = 0.0;
+      traj_point.Position.Actuators.Actuator6 = 0.0;
+      executeAngularTrajectoryPoint(traj_point, true);
+      timed_trajectory_server_->setPreempted();
+      ROS_INFO("Joint trajectory server preempted by client");
+      return;
+    }
+
+// arm at 600 Hz
+    for (int j = 0; j < inner_loop; j++)
+    {
+      if (i == 0 && j == 0)
+        continue;
+      else
+      {
+        t = sec * i + inner_sec * j;
+        if (t > time_points[num_points - 1])
+          break;
+      }
+      // get current joint positions
+      {
+        boost::recursive_mutex::scoped_lock lock(api_mutex);
+        GetAngularPosition(position_data);
+      }
+      current_joint_pos[0] = position_data.Actuators.Actuator1 * DEG_TO_RAD;
+      current_joint_pos[1] = position_data.Actuators.Actuator2 * DEG_TO_RAD;
+      current_joint_pos[2] = position_data.Actuators.Actuator3 * DEG_TO_RAD;
+      current_joint_pos[3] = position_data.Actuators.Actuator4 * DEG_TO_RAD;
+      current_joint_pos[4] = position_data.Actuators.Actuator5 * DEG_TO_RAD;
+      current_joint_pos[5] = position_data.Actuators.Actuator6 * DEG_TO_RAD;
+      // get error
+      for (int i = 0; i < NUM_JACO_JOINTS; i++)
+      {
+        current_point = simplify_angle(current_joint_pos[i]);
+        error[i] = nearest_equivalent(simplify_angle((splines.at(i))(t)), current_point) - current_point;
+      }
+      // populate the velocity command
+      traj_point.Position.Actuators.Actuator1 = (KP * error[0] + KV * (error[0] - prev_error[0]) * RAD_TO_DEG);
+      traj_point.Position.Actuators.Actuator2 = (KP * error[1] + KV * (error[1] - prev_error[1]) * RAD_TO_DEG);
+      traj_point.Position.Actuators.Actuator3 = (KP * error[2] + KV * (error[2] - prev_error[2]) * RAD_TO_DEG);
+      traj_point.Position.Actuators.Actuator4 = (KP * error[3] + KV * (error[3] - prev_error[3]) * RAD_TO_DEG);
+      traj_point.Position.Actuators.Actuator5 = (KP * error[4] + KV * (error[4] - prev_error[4]) * RAD_TO_DEG);
+      traj_point.Position.Actuators.Actuator6 = (KP * error[5] + KV * (error[5] - prev_error[5]) * RAD_TO_DEG);
+      // send the velocity command to real robot
+      executeAngularTrajectoryPoint(traj_point, true);
+      for (int i = 0; i < NUM_JACO_JOINTS; i++)
+        prev_error[i] = error[i];
+
+      if (j < inner_loop - 1)
+        inner_rate.sleep();
+    }
+
+    rate.sleep();
+  }
+
+  ROS_INFO("Trajectory Control Complete.");
+  control_msgs::FollowJointTrajectoryResult result;
+  result.error_code = control_msgs::FollowJointTrajectoryResult::SUCCESSFUL;
+  timed_trajectory_server_->setSucceeded(result);
+}
+
 
 void JacoTrajectoryController::executeSmoothTrajectory(const control_msgs::FollowJointTrajectoryGoalConstPtr &goal)
 {
