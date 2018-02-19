@@ -54,6 +54,7 @@ private:
 
   //Actions
   actionlib::SimpleActionServer<control_msgs::FollowJointTrajectoryAction> smoothTrajectoryServer;
+  actionlib::SimpleActionServer<control_msgs::FollowJointTrajectoryAction> timed_trajectory_server_;
 
   // Messages
   ros::Publisher angularCmdPublisher;
